@@ -41,10 +41,8 @@ class MetaDataSparkle {
   public: 
     SparkleTransaction *LOCK_TX=nullptr;
     pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-    pthread_cond_t  cond = PTHREAD_COND_INITIALIZER;
-    std::vector<int> WAIT_TXS;
+    std::vector<SparkleTransaction*> WAIT_TXS;
     std::vector< std::tuple<SparkleTransaction*,uint64_t> > READ_DEPS;
-    SpinLock READ_DEPS_mutex_;
 };
 
 template <std::size_t N, class KeyType, class ValueType> class MVCCHashMap {

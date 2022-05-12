@@ -168,5 +168,8 @@ public:
   Operation operation; // never used
   std::vector<SparkleRWKey> readSet, writeSet;
   bool abort_flag = false;
+  pthread_mutex_t waiting_lock = PTHREAD_MUTEX_INITIALIZER;
+  pthread_cond_t  waiting_cond = PTHREAD_COND_INITIALIZER;
+  int waiting = 0;
 };
 } // namespace aria

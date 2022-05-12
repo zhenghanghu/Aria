@@ -336,29 +336,25 @@ public:
     auto *metadata = map_.get_metadata_sparkle(k);
 
     auto &lock = metadata->lock;
-    auto &cond = metadata->cond;
 
     pthread_mutex_lock(&lock);
     if( metadata->LOCK_TX==nullptr ){
       metadata->LOCK_TX = T;
+      pthread_mutex_unlock(&lock);
+      return 1;
+    }
+    else if( metadata->LOCK_TX->id < T->id ){
+      metadata->WAIT_TXS.push_back(T);
+      T->waiting = 1;
+      pthread_mutex_unlock(&lock);
+      return 0;
     }
     else{
-
-      if( metadata->LOCK_TX->id > T->id ){//eject
-        metadata->LOCK_TX->abort_flag=true;
-        metadata->LOCK_TX = T;
-      }
-      else{
-        //LOG(INFO)<<"wait!";
-        while( metadata->LOCK_TX!=nullptr ){
-          pthread_cond_wait(&cond, &lock);//wait
-        }
-        //LOG(INFO)<<"finish wait!";
-        metadata->LOCK_TX = T;
-      }
+      metadata->LOCK_TX->abort_flag=true;
+      metadata->LOCK_TX = T;
     }
-    pthread_mutex_unlock(&lock);
 
+    pthread_mutex_unlock(&lock);
     return 1;
   }
 
@@ -367,25 +363,21 @@ public:
     auto *metadata = map_.get_metadata_sparkle(k);
 
     auto &lock = metadata->lock;
-    auto &cond = metadata->cond;
 
-    //LOG(INFO)<<"wait read!"<<" ("<<T->id<<")";
     pthread_mutex_lock(&lock);
-    while( metadata->LOCK_TX!=nullptr && metadata->LOCK_TX->id < T->id ){
-      
-      pthread_cond_wait(&cond, &lock);//wait
+    if( metadata->LOCK_TX!=nullptr && metadata->LOCK_TX->id < T->id ){
+      metadata->WAIT_TXS.push_back(T);
+      T->waiting = 1;
+      pthread_mutex_unlock(&lock);
+      return std::make_tuple(nullptr,nullptr);
     }
-    pthread_mutex_unlock(&lock);
-    //LOG(INFO)<<"wait success!"<<" ("<<T->id<<")";
 
     auto *v_ptr = map_.get_key_version_prev(k, T->id);//VersionTupleType: std::tuple<uint64_t, ValueType>;
     auto &v = *v_ptr;
 
-    metadata->READ_DEPS_mutex_.lock();
     metadata->READ_DEPS.push_back( std::make_tuple(T,std::get<0>(v)) );
-    metadata->READ_DEPS_mutex_.unlock();
 
-
+    pthread_mutex_unlock(&lock);
     auto &v1 = std::get<1>(v);
 
     return std::make_tuple(&std::get<0>(v1), &std::get<1>(v1));
@@ -396,20 +388,26 @@ public:
     auto *metadata = map_.get_metadata_sparkle(k);
     
     auto &lock = metadata->lock;
-    auto &cond = metadata->cond;
-
     pthread_mutex_lock(&lock);
+
     if( metadata->LOCK_TX == T ){
       metadata->LOCK_TX = nullptr;
-      pthread_cond_broadcast(&cond);
+      
+      for(auto it = metadata->WAIT_TXS.begin(); it!=metadata->WAIT_TXS.end(); it++){
+        auto *txn = *it;
+        pthread_mutex_lock( &txn->waiting_lock );
+        txn->waiting = 0;
+        pthread_cond_signal( &txn->waiting_cond );
+        pthread_mutex_unlock( &txn->waiting_lock );
+      }
+      metadata->WAIT_TXS.clear();
+      
       pthread_mutex_unlock(&lock);
     }
     else{
 
-      pthread_mutex_unlock(&lock);
       map_.remove_key_version(k, T->id);
 
-      metadata->READ_DEPS_mutex_.lock();
       for(auto it = metadata->READ_DEPS.begin(); it!=metadata->READ_DEPS.end() ;){
         auto *txn = std::get<0>(*it);
         auto version = std::get<1>(*it);
@@ -421,8 +419,7 @@ public:
           it++;
         }
       }
-
-      metadata->READ_DEPS_mutex_.unlock();
+      pthread_mutex_unlock(&lock);
 
     }
   }
@@ -433,7 +430,6 @@ public:
     auto *metadata = map_.get_metadata_sparkle(k);
 
     auto &lock = metadata->lock;
-    auto &cond = metadata->cond;
 
     pthread_mutex_lock(&lock);
 
@@ -447,7 +443,6 @@ public:
     std::get<0>(row).store(T->id);
     std::get<1>(row) = v;
 
-    metadata->READ_DEPS_mutex_.lock();
     //LOG(INFO)<<metadata->READ_DEPS.size();
     for(auto it = metadata->READ_DEPS.begin(); it!=metadata->READ_DEPS.end() ;){
       auto *txn = std::get<0>(*it);
@@ -459,10 +454,17 @@ public:
         it++;
       }
     }
-    metadata->READ_DEPS_mutex_.unlock();
 
     metadata->LOCK_TX = nullptr;
-    pthread_cond_broadcast(&cond);
+    for(auto it = metadata->WAIT_TXS.begin(); it!=metadata->WAIT_TXS.end(); it++){
+        auto *txn = *it;
+        pthread_mutex_lock( &txn->waiting_lock );
+        txn->waiting = 0;
+        pthread_cond_signal( &txn->waiting_cond );
+        pthread_mutex_unlock( &txn->waiting_lock );
+    }
+    metadata->WAIT_TXS.clear();
+
     pthread_mutex_unlock(&lock);
     return 1;
   }

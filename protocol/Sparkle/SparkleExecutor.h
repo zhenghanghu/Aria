@@ -215,6 +215,18 @@ public:
       ITable *table = db.find_table(table_id, partition_id);
 
       auto row = table->read(key, &txn);
+      auto *ptr = std::get<0>(row);
+      while( ptr == nullptr ){
+    
+        pthread_mutex_lock( &txn.waiting_lock );
+        while( txn.waiting == 1){
+          pthread_cond_wait( &txn.waiting_cond, &txn.waiting_lock);
+        }
+        pthread_mutex_unlock( &txn.waiting_lock );
+
+        row = table->read(key, &txn);
+        ptr = std::get<0>(row);
+      }
 
       SparkleHelper::read(row, value, table->value_size());
       //LOG(INFO) << "read end";
@@ -232,7 +244,15 @@ public:
 
       ITable *table = db.find_table(table_id, partition_id);
       
-      table->lock(key, &txn);
+      while( table->lock(key, &txn)==0 ){
+        
+        pthread_mutex_lock( &txn.waiting_lock );
+        while( txn.waiting == 1){
+          pthread_cond_wait( &txn.waiting_cond, &txn.waiting_lock);
+        }
+        pthread_mutex_unlock( &txn.waiting_lock );
+
+      }
       //LOG(INFO) << "write end";
     };
 
