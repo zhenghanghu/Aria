@@ -9,6 +9,9 @@
 #include <glog/logging.h>
 #include <list>
 #include <unordered_map>
+#include <vector>
+#include "protocol/Sparkle/SparkleTransaction.h"
+#include <pthread.h>
 
 namespace aria {
 
@@ -16,18 +19,38 @@ namespace aria {
  *  MVCC Hash Map -- overview --
  *
  *  KeyType -> std::list<std::tuple<uint64_t, ValueType>>,
- *  uint64_t: version, ValueType: value
- *
+ *  ValueType: std::tuple<MetaDataType, ycsb::value>
+ *  uint64_t: version
+ * 
  *  By default, the first node is a sentinel node, then comes the newest version
  * (the largest value). The upper application (e.g., worker thread) is
  * responsible for data vacuum. Given a vacuum_version, all versions less than
  * or equal to vacuum_version will be garbage collected.
  */
 
+/* New MVCC Hash Map for Sparkle
+ *
+ * KeyType: ycsb:key
+ * ValueType: std::tuple<MetaDataType, ycsb::value>
+ *
+ * ycsb:key -> std::tuple< MetaDataSparkle , std::list<std::tuple<uint64_t, ValueType>> >
+ * 
+ */
+
+class MetaDataSparkle {
+  public: 
+    SparkleTransaction *LOCK_TX=nullptr;
+    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t  cond = PTHREAD_COND_INITIALIZER;
+    std::vector<int> WAIT_TXS;
+    std::vector< std::tuple<SparkleTransaction*,uint64_t> > READ_DEPS;
+    SpinLock READ_DEPS_mutex_;
+};
+
 template <std::size_t N, class KeyType, class ValueType> class MVCCHashMap {
 public:
   using VersionTupleType = std::tuple<uint64_t, ValueType>;
-  using MappedValueType = std::list<VersionTupleType>;
+  using MappedValueType = std::tuple<MetaDataSparkle, std::list<VersionTupleType>>;
   using HashMapType = std::unordered_map<KeyType, MappedValueType>;
   using HasherType = typename HashMapType::hasher;
 
@@ -42,7 +65,7 @@ public:
           }
 
           // check if the list is empty
-          auto &l = it->second;
+          auto &l = std::get<1>(it->second);
           return !l.empty();
         },
         bucket_number(key));
@@ -58,7 +81,7 @@ public:
             return false;
           }
 
-          auto &l = it->second;
+          auto &l = std::get<1>(it->second);
           for (VersionTupleType &vt : l) {
             if (get_version(vt) == version) {
               return true;
@@ -92,7 +115,7 @@ public:
           if (it == map.end()) {
             return false;
           }
-          auto &l = it->second;
+          auto &l = std::get<1>(it->second);
 
           for (auto lit = l.begin(); lit != l.end(); lit++) {
             if (get_version(*lit) == version) {
@@ -109,25 +132,26 @@ public:
   ValueType &insert_key_version_holder(const KeyType &key, uint64_t version) {
     return apply_ref(
         [&key, version](HashMapType &map) -> ValueType & {
-          auto &l = map[key];
+          auto &l = std::get<1>(map[key]);
+          auto lit = l.begin();
+
           // always insert to the front if the list is empty
           if (l.empty()) {
             l.emplace_front();
+            lit = l.begin();
           } else {
-            // make sure the version is larger than the head, making sure the
-            // versions are always monotonically decreasing
-            auto &head = l.front();
-            auto head_version = get_version(head);
-            CHECK(version > head_version)
-                << "the new version: " << version
-                << " is not larger than the current latest version: "
-                << head_version;
-            l.emplace_front();
+            // make sure the versions are always monotonically decreasing
+            for ( ; lit != l.end(); lit++) {
+              if (get_version(*lit) < version) {
+                lit = l.emplace(lit);
+                break;
+              }
+            }
           }
           // set the version
-          std::get<0>(l.front()) = version;
+          std::get<0>(*lit) = version;
           // std::get<0> returns the version
-          return std::get<1>(l.front());
+          return std::get<1>(*lit);
         },
         bucket_number(key));
   }
@@ -140,7 +164,7 @@ public:
           if (it == map.end()) {
             return 0;
           } else {
-            auto &l = it->second;
+            auto &l = std::get<1>(it->second);
             return l.size();
           }
         },
@@ -156,7 +180,7 @@ public:
           if (it == map.end()) {
             return nullptr;
           }
-          auto &l = it->second;
+          auto &l = std::get<1>(it->second);
           for (VersionTupleType &vt : l) {
             if (get_version(vt) == version) {
               return &get_value(vt);
@@ -168,25 +192,42 @@ public:
   }
   // return the value of a particular key and the version older than the
   // specific version nullptr if not exists.
-  ValueType *get_key_version_prev(const KeyType &key, uint64_t version) {
+  VersionTupleType *get_key_version_prev(const KeyType &key, uint64_t version) {
     return apply(
-        [&key, version](HashMapType &map) -> ValueType * {
+        [&key, version](HashMapType &map) -> VersionTupleType * {
           auto it = map.find(key);
           if (it == map.end()) {
             return nullptr;
           }
-          auto &l = it->second;
+          auto &l = std::get<1>(it->second);
+
           for (VersionTupleType &vt : l) {
+
             if (get_version(vt) < version) {
-              return &get_value(vt);
+
+              return &vt;
             }
           }
           return nullptr;
         },
         bucket_number(key));
   }
+  //Get the metadata associated with key
+  MetaDataSparkle *get_metadata_sparkle(const KeyType &key) {
+    return apply(
+        [&key](HashMapType &map) -> MetaDataSparkle * {
+          auto it = map.find(key);
+          if (it == map.end()) {
+            return nullptr;
+          }
+          auto &l = std::get<0>(it->second);
 
-  // remove all versions less than or equal to vacuum_version
+          return &l;
+        },
+        bucket_number(key));
+  }
+
+  // remove all versions less than vacuum_version
   std::size_t vacuum_key_versions(const KeyType &key, uint64_t vacuum_version) {
     return apply(
         [&key, vacuum_version](HashMapType &map) -> std::size_t {
@@ -196,12 +237,12 @@ public:
           }
 
           std::size_t size = 0;
-          auto &l = it->second;
+          auto &l = std::get<1>(it->second);
           auto lit = l.end();
 
           while (lit != l.begin()) {
             lit--;
-            if (get_version(*lit) <= vacuum_version) {
+            if (get_version(*lit) < vacuum_version) {
               lit = l.erase(lit);
               size++;
             } else {
@@ -223,7 +264,7 @@ public:
           }
 
           std::size_t size = 0;
-          auto &l = it->second;
+          auto &l = std::get<1>(it->second);
           auto lit = l.begin();
           if (lit == l.end()) {
             return 0;

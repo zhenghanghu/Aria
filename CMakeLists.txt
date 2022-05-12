@@ -35,8 +35,8 @@ else()
     target_link_libraries(common ${jemalloc_lib} glog gflags)
 endif()
 
-add_executable(bench_tpcc bench_tpcc.cpp)
-target_link_libraries(bench_tpcc common)
+#add_executable(bench_tpcc bench_tpcc.cpp)
+#target_link_libraries(bench_tpcc common)
 
 add_executable(bench_ycsb bench_ycsb.cpp)
 target_link_libraries(bench_ycsb common)

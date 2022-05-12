@@ -18,7 +18,8 @@ assert len(sys.argv) == 3, "this script expects two parameters"
 machine_id = int(sys.argv[1]) 
 port = int(sys.argv[2]) 
 
-ips = load_ips('ips.txt')
+#ips = load_ips('ips.txt')
+ips = [["10","20"]]
 
 n_machines = len(ips)
 

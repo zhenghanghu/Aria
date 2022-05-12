@@ -10,6 +10,7 @@
 #include "protocol/Aria/AriaExecutor.h"
 #include "protocol/Aria/AriaHelper.h"
 #include "protocol/Aria/AriaTransaction.h"
+#include <glog/logging.h>
 
 #include <atomic>
 #include <thread>
@@ -38,6 +39,7 @@ public:
 
     storages.resize(context.batch_size);
     transactions.resize(context.batch_size);
+    LOG(INFO) << context.batch_size;
   }
 
   void coordinator_start() override {
@@ -61,13 +63,13 @@ public:
       signal_worker(ExecutorStatus::Aria_READ);
       wait_all_workers_start();
       wait_all_workers_finish();
-      broadcast_stop();
-      wait4_stop(n_coordinators - 1);
+      //broadcast_stop();
+      //wait4_stop(n_coordinators - 1);
       n_completed_workers.store(0);
       set_worker_status(ExecutorStatus::STOP);
       wait_all_workers_finish();
       // wait for all machines until they finish the Aria_READ phase.
-      wait4_ack();
+      //wait4_ack();
 
       // Allow each worker to commit transactions
       n_started_workers.store(0);
@@ -75,13 +77,13 @@ public:
       signal_worker(ExecutorStatus::Aria_COMMIT);
       wait_all_workers_start();
       wait_all_workers_finish();
-      broadcast_stop();
-      wait4_stop(n_coordinators - 1);
+      //broadcast_stop();
+      //wait4_stop(n_coordinators - 1);
       n_completed_workers.store(0);
       set_worker_status(ExecutorStatus::STOP);
       wait_all_workers_finish();
       // wait for all machines until they finish the Aria_COMMIT phase.
-      wait4_ack();
+      //wait4_ack();
     }
 
     signal_worker(ExecutorStatus::EXIT);

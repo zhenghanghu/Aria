@@ -77,6 +77,11 @@ public:
     LOG(INFO) << "Coordinator starts to run " << workers.size() << " workers.";
 
     for (auto i = 0u; i < workers.size(); i++) {
+      if( i==workers.size()-1 && ( context.protocol == "Serial" || context.protocol == "Sparkle") ){
+        LOG(INFO)<<"Protocol Serial/Sparkle detected!";
+        continue;
+      }
+
       threads.emplace_back(&Worker::start, workers[i].get());
       if (context.cpu_affinity) {
         pin_thread_to_core(threads[i]);
@@ -352,7 +357,7 @@ private:
     CPU_SET(core_id++, &cpuset);
     int rc =
         pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
-    CHECK(rc == 0);
+    //CHECK(rc == 0);
 #endif
   }
 

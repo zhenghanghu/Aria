@@ -38,7 +38,17 @@
 #include "protocol/Pwv/PwvManager.h"
 #include "protocol/Pwv/PwvTransaction.h"
 
+#include "protocol/Serial/Serial.h"
+#include "protocol/Serial/SerialExecutor.h"
+#include "protocol/Serial/SerialManager.h"
+#include "protocol/Serial/SerialTransaction.h"
+
+#include "protocol/Sparkle/SparkleExecutor.h"
+#include "protocol/Sparkle/SparkleManager.h"
+#include "protocol/Sparkle/SparkleTransaction.h"
+
 #include <unordered_set>
+#include <glog/logging.h>
 
 namespace aria {
 
@@ -66,7 +76,7 @@ public:
 
     std::unordered_set<std::string> protocols = {
        "TwoPL",
-        "Calvin", "Bohm",   "Aria",   "AriaFB", "Pwv"};
+        "Calvin", "Bohm",   "Aria",   "AriaFB", "Pwv", "Serial", "Sparkle"};
     CHECK(protocols.count(context.protocol) == 1);
 
     std::vector<std::shared_ptr<Worker>> workers;
@@ -213,7 +223,47 @@ public:
 
       workers.push_back(manager);
 
-    } else {
+    } else if ( context.protocol == "Serial" ){
+        using TransactionType = aria::SerialTransaction;
+        using WorkloadType =
+          typename InferType<Context>::template WorkloadType<TransactionType>;
+
+        // create manager
+        //std::atomic<bool> &stop_flag
+        auto manager = std::make_shared<SerialManager<WorkloadType>>(
+            coordinator_id, context.worker_num, db, context, stop_flag);
+
+        // create worker
+        workers.push_back(std::make_shared<SerialExecutor<WorkloadType>>(
+            coordinator_id, 0, db, context, manager->transactions,
+            manager->storages, manager->epoch, manager->worker_status,
+            manager->total_abort, manager->n_completed_workers,
+            manager->n_started_workers, stop_flag));
+
+        workers.push_back(manager);
+    }
+    else if ( context.protocol == "Sparkle" ){
+      using TransactionType = aria::SparkleTransaction;
+      using WorkloadType =
+        typename InferType<Context>::template WorkloadType<TransactionType>;
+
+      // create manager
+      auto manager = std::make_shared<SparkleManager<WorkloadType>>(
+        coordinator_id, context.worker_num, db, context, stop_flag);
+
+      // create worker
+      for (auto i = 0u; i < context.worker_num; i++) {
+        workers.push_back(std::make_shared<SparkleExecutor<WorkloadType>>(
+            coordinator_id, i, db, context, manager->transactions,
+            manager->storages, manager->epoch, manager->worker_status,
+            manager->total_abort, manager->n_completed_workers,
+            manager->n_started_workers, stop_flag, manager->NEXT_TX));
+      }
+
+      workers.push_back(manager);
+
+    }
+    else {
       CHECK(false) << "protocol: " << context.protocol << " is not supported.";
     }
 

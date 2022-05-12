@@ -9,7 +9,11 @@
 #include "common/HashMap.h"
 #include "common/MVCCHashMap.h"
 #include "common/StringPiece.h"
+#include "common/SpinLock.h"
 #include <memory>
+#include <pthread.h>
+
+#include "glog/logging.h"
 
 #include "core/Context.h"
 
@@ -59,6 +63,14 @@ public:
   virtual std::size_t tableID() = 0;
 
   virtual std::size_t partitionID() = 0;
+
+  virtual int lock(const void *key, SparkleTransaction *T) = 0;
+
+  virtual std::tuple<MetaDataType *, void *> read(const void *key, SparkleTransaction *T) = 0;
+
+  virtual void UnlockAndRemove(const void *key, SparkleTransaction *T) = 0;
+
+  virtual int addVersion(const void *key, const void *value, SparkleTransaction *T) = 0;
 };
 
 /* parameter version is not used in Table. */
@@ -161,6 +173,14 @@ public:
 
   std::size_t partitionID() override { return partitionID_; }
 
+  int lock(const void *key, SparkleTransaction *T) override { return 1; }
+
+  std::tuple<MetaDataType *, void *> read(const void *key, SparkleTransaction *T) override { return std::make_tuple(nullptr,nullptr); }
+
+  void UnlockAndRemove(const void *key, SparkleTransaction *T) override { return; }
+
+  int addVersion(const void *key, const void *value, SparkleTransaction *T) override { return 1; }
+
 private:
   HashMap<N, KeyType, std::tuple<MetaDataType, ValueType>> map_;
   std::size_t tableID_;
@@ -212,7 +232,7 @@ public:
     auto *v_ptr = map_.get_key_version_prev(k, version);
     CHECK(v_ptr != nullptr)
         << "key with version: " << version << " does not exist.";
-    auto &v = *v_ptr;
+    auto &v = std::get<1>(*v_ptr);
     return std::make_tuple(&std::get<0>(v), &std::get<1>(v));
   }
 
@@ -231,7 +251,7 @@ public:
     auto *v_ptr = map_.get_key_version_prev(k, version);
     CHECK(v_ptr != nullptr)
         << "key with version: " << version << " does not exist.";
-    auto &v = *v_ptr;
+    auto &v = std::get<1>(*v_ptr);
     return std::get<0>(v);
   }
 
@@ -298,6 +318,155 @@ public:
 
   std::size_t partitionID() override { return partitionID_; }
 
+  /*
+  class MetaDataSparkle {
+    public: 
+      SparkleTransaction *LOCK_TX=nullptr;
+      pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+      pthread_cond_t  cond = PTHREAD_COND_INITIALIZER;
+      std::vector<int> WAIT_TXS;
+      std::vector< std::tuple<SparkleTransaction*,uint64_t> > READ_DEPS;
+      SpinLock READ_DEPS_mutex_;
+  };
+  */
+
+  int lock(const void *key, SparkleTransaction *T) override {
+
+    const auto &k = *static_cast<const KeyType *>(key);
+    auto *metadata = map_.get_metadata_sparkle(k);
+
+    auto &lock = metadata->lock;
+    auto &cond = metadata->cond;
+
+    pthread_mutex_lock(&lock);
+    if( metadata->LOCK_TX==nullptr ){
+      metadata->LOCK_TX = T;
+    }
+    else{
+
+      if( metadata->LOCK_TX->id > T->id ){//eject
+        metadata->LOCK_TX->abort_flag=true;
+        metadata->LOCK_TX = T;
+      }
+      else{
+        //LOG(INFO)<<"wait!";
+        while( metadata->LOCK_TX!=nullptr ){
+          pthread_cond_wait(&cond, &lock);//wait
+        }
+        //LOG(INFO)<<"finish wait!";
+        metadata->LOCK_TX = T;
+      }
+    }
+    pthread_mutex_unlock(&lock);
+
+    return 1;
+  }
+
+  std::tuple<MetaDataType *, void *> read(const void *key, SparkleTransaction *T) override {//std::tuple<MetaDataType, ValueType> ValueType = ycsb::value
+    const auto &k = *static_cast<const KeyType *>(key);
+    auto *metadata = map_.get_metadata_sparkle(k);
+
+    auto &lock = metadata->lock;
+    auto &cond = metadata->cond;
+
+    //LOG(INFO)<<"wait read!"<<" ("<<T->id<<")";
+    pthread_mutex_lock(&lock);
+    while( metadata->LOCK_TX!=nullptr && metadata->LOCK_TX->id < T->id ){
+      
+      pthread_cond_wait(&cond, &lock);//wait
+    }
+    pthread_mutex_unlock(&lock);
+    //LOG(INFO)<<"wait success!"<<" ("<<T->id<<")";
+
+    auto *v_ptr = map_.get_key_version_prev(k, T->id);//VersionTupleType: std::tuple<uint64_t, ValueType>;
+    auto &v = *v_ptr;
+
+    metadata->READ_DEPS_mutex_.lock();
+    metadata->READ_DEPS.push_back( std::make_tuple(T,std::get<0>(v)) );
+    metadata->READ_DEPS_mutex_.unlock();
+
+
+    auto &v1 = std::get<1>(v);
+
+    return std::make_tuple(&std::get<0>(v1), &std::get<1>(v1));
+  }
+
+  void UnlockAndRemove(const void *key, SparkleTransaction *T) override {
+    const auto &k = *static_cast<const KeyType *>(key);
+    auto *metadata = map_.get_metadata_sparkle(k);
+    
+    auto &lock = metadata->lock;
+    auto &cond = metadata->cond;
+
+    pthread_mutex_lock(&lock);
+    if( metadata->LOCK_TX == T ){
+      metadata->LOCK_TX = nullptr;
+      pthread_cond_broadcast(&cond);
+      pthread_mutex_unlock(&lock);
+    }
+    else{
+
+      pthread_mutex_unlock(&lock);
+      map_.remove_key_version(k, T->id);
+
+      metadata->READ_DEPS_mutex_.lock();
+      for(auto it = metadata->READ_DEPS.begin(); it!=metadata->READ_DEPS.end() ;){
+        auto *txn = std::get<0>(*it);
+        auto version = std::get<1>(*it);
+        if( T->id == version  ){
+          txn->abort_flag = true;
+          metadata->READ_DEPS.erase(it);
+        }
+        else{
+          it++;
+        }
+      }
+
+      metadata->READ_DEPS_mutex_.unlock();
+
+    }
+  }
+
+  int addVersion(const void *key, const void *value, SparkleTransaction *T) override {
+    const auto &k = *static_cast<const KeyType *>(key);
+    const auto &v = *static_cast<const ValueType *>(value);
+    auto *metadata = map_.get_metadata_sparkle(k);
+
+    auto &lock = metadata->lock;
+    auto &cond = metadata->cond;
+
+    pthread_mutex_lock(&lock);
+
+    if( metadata->LOCK_TX != T ){
+      T->abort_flag = true;
+      pthread_mutex_unlock(&lock);
+      return 0;//abort
+    }
+    
+    auto &row = map_.insert_key_version_holder(k, T->id);
+    std::get<0>(row).store(T->id);
+    std::get<1>(row) = v;
+
+    metadata->READ_DEPS_mutex_.lock();
+    //LOG(INFO)<<metadata->READ_DEPS.size();
+    for(auto it = metadata->READ_DEPS.begin(); it!=metadata->READ_DEPS.end() ;){
+      auto *txn = std::get<0>(*it);
+      if( T->id < txn->id  ){
+        txn->abort_flag = true;
+        metadata->READ_DEPS.erase(it);
+      }
+      else{
+        it++;
+      }
+    }
+    metadata->READ_DEPS_mutex_.unlock();
+
+    metadata->LOCK_TX = nullptr;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&lock);
+    return 1;
+  }
+
 private:
   MVCCHashMap<N, KeyType, std::tuple<MetaDataType, ValueType>> map_;
   std::size_t tableID_;
@@ -310,7 +479,7 @@ public:
   static std::unique_ptr<ITable> create_table(const Context &context,
                                               std::size_t tableID,
                                               std::size_t partitionID) {
-    if (context.mvcc) {
+    if (context.mvcc || context.protocol == "Sparkle") {
       return std::make_unique<MVCCTable<N, KeyType, ValueType>>(tableID,
                                                                 partitionID);
     } else {
@@ -318,6 +487,6 @@ public:
                                                             partitionID);
     }
   }
-};
+};  
 
 } // namespace aria
