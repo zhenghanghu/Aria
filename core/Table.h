@@ -70,7 +70,7 @@ public:
 
   virtual void UnlockAndRemove(const void *key, SparkleTransaction *T) = 0;
 
-  virtual int addVersion(const void *key, const void *value, SparkleTransaction *T) = 0;
+  virtual int addVersion(const void *key, const void *value, SparkleTransaction *T, std::atomic<uint32_t> &NEXT_TX) = 0;
 };
 
 /* parameter version is not used in Table. */
@@ -179,7 +179,7 @@ public:
 
   void UnlockAndRemove(const void *key, SparkleTransaction *T) override { return; }
 
-  int addVersion(const void *key, const void *value, SparkleTransaction *T) override { return 1; }
+  int addVersion(const void *key, const void *value, SparkleTransaction *T, std::atomic<uint32_t> &NEXT_TX) override { return 1; }
 
 private:
   HashMap<N, KeyType, std::tuple<MetaDataType, ValueType>> map_;
@@ -424,7 +424,7 @@ public:
     }
   }
 
-  int addVersion(const void *key, const void *value, SparkleTransaction *T) override {
+  int addVersion(const void *key, const void *value, SparkleTransaction *T, std::atomic<uint32_t> &NEXT_TX) override {
     const auto &k = *static_cast<const KeyType *>(key);
     const auto &v = *static_cast<const ValueType *>(value);
     auto *metadata = map_.get_metadata_sparkle(k);
@@ -448,6 +448,9 @@ public:
       auto *txn = std::get<0>(*it);
       if( T->id < txn->id  ){
         txn->abort_flag = true;
+        metadata->READ_DEPS.erase(it);
+      }
+      else if( txn->id < NEXT_TX.load() ){
         metadata->READ_DEPS.erase(it);
       }
       else{

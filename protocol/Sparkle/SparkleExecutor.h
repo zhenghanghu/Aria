@@ -149,7 +149,7 @@ public:
       auto table = db.find_table(tableId, partitionId);
       auto key = writeKey.get_key();
       auto value = writeKey.get_value();
-      if( table->addVersion(key, value, &txn)==0 ){
+      if( table->addVersion(key, value, &txn, NEXT_TX)==0 ){
         txn.abort_flag = true;
         return;
       }
